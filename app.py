@@ -3,6 +3,19 @@ from fastapi.responses import FileResponse, JSONResponse
 from PIL import Image, ImageOps
 import io, tempfile, numpy as np, torch, os, urllib.request
 
+# --- PATCH kompatibilitas untuk basicsr + torchvision baru ---
+# Beberapa versi basicsr masih mengimpor `torchvision.transforms.functional_tensor.rgb_to_grayscale`
+# yang sudah dihapus di torchvision modern. Shim ini menyediakan modul dummy agar import tidak gagal.
+import types, sys
+try:
+    from torchvision.transforms import functional as _F
+    mod = types.ModuleType("torchvision.transforms.functional_tensor")
+    mod.rgb_to_grayscale = _F.rgb_to_grayscale
+    sys.modules["torchvision.transforms.functional_tensor"] = mod
+except Exception:
+    pass
+# --- END PATCH ---
+
 from realesrgan import RealESRGANer
 from basicsr.archs.rrdbnet_arch import RRDBNet
 
@@ -15,7 +28,6 @@ WEIGHT_URL = "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/Re
 
 os.makedirs(WEIGHTS_DIR, exist_ok=True)
 if not os.path.exists(WEIGHT_PATH):
-    # Download sekali saat container start
     urllib.request.urlretrieve(WEIGHT_URL, WEIGHT_PATH)
 
 # ====== Model config (x4plus) ======
@@ -24,7 +36,7 @@ rrdbnet = RRDBNet(
     num_feat=64, num_block=23, num_grow_ch=32, scale=4
 )
 
-# Catatan: half=True hanya jika ada GPU CUDA (Railway free: CPU, jadi False)
+# half=True hanya jika ada GPU CUDA (Railway Free: CPU → False)
 upsampler = RealESRGANer(
     scale=4,
     model_path=WEIGHT_PATH,
@@ -60,9 +72,9 @@ async def upscale_image(
     """
     outscale: faktor ESRGAN (default 2x supaya ringan)
     final_scale: faktor akhir setelah ESRGAN (Lanczos). Contoh:
-      - 2x ESRGAN murni         -> outscale=2, final_scale=2
+      - 2x ESRGAN murni          -> outscale=2, final_scale=2
       - 4x hemat CPU (disarankan)-> outscale=2, final_scale=4
-      - 4x maksimal (lebih berat)-> outscale=4, final_scale=4
+      - 4x maksimal (lebih berat) -> outscale=4, final_scale=4
     """
     try:
         data = await file.read()
@@ -79,8 +91,7 @@ async def upscale_image(
             pil_img = pil_img.convert("RGB")
 
         # Tentukan tile otomatis
-        tile_choice = pick_tile_size(pil_img.width, pil_img.height)
-        upsampler.tile = tile_choice
+        upsampler.tile = pick_tile_size(pil_img.width, pil_img.height)
 
         # PIL (RGB) -> NumPy (BGR)
         img_rgb = np.array(pil_img)
@@ -95,8 +106,7 @@ async def upscale_image(
 
         # Kembalikan alpha (jika ada)
         if alpha is not None:
-            new_w, new_h = out_pil.width, out_pil.height
-            alpha_up = alpha.resize((new_w, new_h), resample=Image.BICUBIC)
+            alpha_up = alpha.resize((out_pil.width, out_pil.height), resample=Image.BICUBIC)
             out_pil = out_pil.convert("RGBA")
             out_pil.putalpha(alpha_up)
 
@@ -107,12 +117,12 @@ async def upscale_image(
             target_h = max(1, int(round(out_pil.height * factor)))
             out_pil = out_pil.resize((target_w, target_h), resample=Image.LANCZOS)
 
-        # Simpan sementara & kirim balik
-        tmp_out = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
-        out_pil.save(tmp_out.name)
+       # Simpan sebagai JPG
+        tmp_out = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
+        out_pil.save(tmp_out.name, format="JPEG", quality=95)
 
-        filename = file.filename or "image.png"
-        return FileResponse(tmp_out.name, media_type="image/png", filename=f"upscaled_{filename}")
+        filename = file.filename or "image.jpg"
+        return FileResponse(tmp_out.name, media_type="image/jpeg", filename=f"upscaled_{filename}")
 
     except Exception as e:
         return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})
